@@ -10,17 +10,18 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 STEAM_API_KEY = os.environ.get('STEAM_API_KEY', '')
 
+# Steam account IDs to monitor (just the IDs, no names needed)
 STEAM_ACCOUNTS = [
-    ('76561199539034019', 'Aurora'),
-    ('76561199528693162', 'EDP'),
-    ('76561199170218093', 'Indra'),
-    ('76561198828817873', 'Kali'),
-    ('76561199166265130', 'Lindemann'),
-    ('76561199069499409', 'Lucifer'),
-    ('76561198150225815', 'Metal'),
-    ('76561198959431750', 'Proc'),
-    ('76561199276478180', 'Soul'),
-    ('76561199559570410', 'Taiga')
+    '76561199539034019',
+    '76561199528693162',
+    '76561199170218093',
+    '76561198828817873',
+    '76561199166265130',
+    '76561199069499409',
+    '76561198150225815',
+    '76561198959431750',
+    '76561199276478180',
+    '76561199559570410'
 ]
 
 DATA_FILE = 'friend_counts.json'
@@ -29,23 +30,29 @@ INIT_FILE = '.initialized'
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("SteamFriendMonitor")
 
-async def fetch_friend_count(session, steam_id, name):
+def get_profile_link(steam_id):
+    """Generate Steam profile link from Steam ID"""
+    return f"steamcommunity.com/profiles/{steam_id}"
+
+async def fetch_friend_count(session, steam_id):
     url = f"http://api.steampowered.com/ISteamUser/GetFriendList/v0001/?key={STEAM_API_KEY}&steamid={steam_id}&relationship=friend"
+    profile_link = get_profile_link(steam_id)
+    
     try:
         async with session.get(url, timeout=10) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 count = len(data.get('friendslist', {}).get('friends', []))
-                return steam_id, name, count
+                return steam_id, profile_link, count
             elif resp.status == 403:
-                logger.warning(f"{name} is private")
-                return steam_id, name, None
+                logger.warning(f"{profile_link} is private")
+                return steam_id, profile_link, None
             else:
-                logger.error(f"{name}: API error {resp.status}")
-                return steam_id, name, None
+                logger.error(f"{profile_link}: API error {resp.status}")
+                return steam_id, profile_link, None
     except Exception as e:
-        logger.error(f"Error fetching {name}: {e}")
-        return steam_id, name, None
+        logger.error(f"Error fetching {profile_link}: {e}")
+        return steam_id, profile_link, None
 
 async def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -87,30 +94,31 @@ async def check_accounts():
     changes = []
 
     async with aiohttp.ClientSession() as session:
-        tasks = [fetch_friend_count(session, sid, name) for sid, name in STEAM_ACCOUNTS]
+        tasks = [fetch_friend_count(session, steam_id) for steam_id in STEAM_ACCOUNTS]
         results = await asyncio.gather(*tasks)
 
-    for sid, name, count in results:
+    for steam_id, profile_link, count in results:
         if count is None:
             continue
-        current[sid] = count
-        prev_count = previous.get(sid)
+        current[steam_id] = count
+        prev_count = previous.get(steam_id)
         if prev_count is not None and not first_run:
             if count > prev_count:
                 diff = count - prev_count
-                msg = f"🎮 <b>New Friend Alert!</b>\n\n{name}: {prev_count} → {count}"
+                msg = f"🎮 <b>New Friend Alert!</b>\n\n{profile_link}: {prev_count} → {count}"
                 await send_telegram_message(msg)
-                changes.append(f"{name}: +{diff}")
+                changes.append(f"{profile_link}: +{diff}")
             elif count < prev_count:
                 diff = prev_count - count
-                msg = f"❌ <b>Friend Removed</b>\n\n{name}: {prev_count} → {count}"
+                msg = f"❌ <b>Friend Removed</b>\n\n{profile_link}: {prev_count} → {count}"
                 await send_telegram_message(msg)
-                changes.append(f"{name}: -{diff}")
+                changes.append(f"{profile_link}: -{diff}")
 
     save_counts(current)
 
     if first_run:
-        summary = "\n".join([f"• {name}: {current.get(sid, 'N/A')} friends" for sid, name in STEAM_ACCOUNTS])
+        summary = "\n".join([f"• {get_profile_link(steam_id)}: {current.get(steam_id, 'N/A')} friends" 
+                           for steam_id in STEAM_ACCOUNTS if steam_id in current])
         msg = f"📊 <b>Initial Summary</b>\n\n{summary}\n\n<i>Bot will now notify on changes only.</i>"
         await send_telegram_message(msg)
     elif changes:
