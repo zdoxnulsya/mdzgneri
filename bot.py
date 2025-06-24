@@ -67,6 +67,34 @@ async def fetch_friend_count(session, steam_id):
         return steam_id, profile_link, None
 
 async def send_telegram_message(message):
+    """Send message to Telegram, splitting if too long"""
+    MAX_MESSAGE_LENGTH = 4000  # Leave some buffer under 4096 limit
+    
+    if len(message) <= MAX_MESSAGE_LENGTH:
+        await _send_single_message(message)
+    else:
+        # Split message into chunks
+        lines = message.split('\n')
+        current_chunk = ""
+        
+        for line in lines:
+            # If adding this line would exceed limit, send current chunk
+            if len(current_chunk + line + '\n') > MAX_MESSAGE_LENGTH:
+                if current_chunk:
+                    await _send_single_message(current_chunk.strip())
+                    current_chunk = line + '\n'
+                else:
+                    # Single line is too long, truncate it
+                    await _send_single_message(line[:MAX_MESSAGE_LENGTH])
+            else:
+                current_chunk += line + '\n'
+        
+        # Send remaining chunk
+        if current_chunk:
+            await _send_single_message(current_chunk.strip())
+
+async def _send_single_message(message):
+    """Send a single message to Telegram"""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         'chat_id': TELEGRAM_CHAT_ID,
@@ -78,6 +106,8 @@ async def send_telegram_message(message):
             async with session.post(url, data=payload) as resp:
                 if resp.status != 200:
                     logger.error(f"Failed to send message: {await resp.text()}")
+                else:
+                    logger.info("Telegram message sent successfully")
         except Exception as e:
             logger.error(f"Telegram error: {e}")
 
@@ -129,10 +159,24 @@ async def check_accounts():
     save_counts(current)
 
     if first_run:
-        summary = "\n".join([f"• {get_profile_link(steam_id)}: {current.get(steam_id, 'N/A')} friends" 
-                           for steam_id in STEAM_ACCOUNTS if steam_id in current])
-        msg = f"📊 <b>Initial Summary</b>\n\n{summary}\n\n<i>Bot will now notify on changes only.</i>"
+        # Send initial summary with account count
+        total_accounts = len([steam_id for steam_id in STEAM_ACCOUNTS if steam_id in current])
+        private_accounts = len(STEAM_ACCOUNTS) - total_accounts
+        
+        msg = f"📊 <b>Initial Setup Complete</b>\n\n"
+        msg += f"✅ Monitoring {total_accounts} accounts\n"
+        if private_accounts > 0:
+            msg += f"🔒 {private_accounts} accounts are private\n"
+        msg += f"\n<i>Bot will now notify on friend changes only.</i>"
+        
         await send_telegram_message(msg)
+        
+        # Send detailed summary in smaller chunks if needed
+        if total_accounts <= 50:  # Only send detailed list for smaller numbers
+            summary = "\n".join([f"• {get_profile_link(steam_id)}: {current.get(steam_id, 'N/A')} friends" 
+                               for steam_id in STEAM_ACCOUNTS if steam_id in current])
+            detailed_msg = f"📋 <b>Account Details</b>\n\n{summary}"
+            await send_telegram_message(detailed_msg)
     elif changes:
         logger.info(f"Changes detected: {', '.join(changes)}")
     else:
