@@ -54,7 +54,7 @@ STEAM_ACCOUNTS = [
     
 ]
 
-DATA_FILE = 'friend_counts.json'
+DATA_FILE = 'friend_data.json'
 INIT_FILE = '.initialized'
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -64,7 +64,8 @@ def get_profile_link(steam_id):
     """Generate Steam profile link from Steam ID"""
     return f"steamcommunity.com/profiles/{steam_id}"
 
-async def fetch_friend_count(session, steam_id):
+async def fetch_friend_list(session, steam_id):
+    """Fetch complete friends list for a Steam account"""
     url = f"http://api.steampowered.com/ISteamUser/GetFriendList/v0001/?key={STEAM_API_KEY}&steamid={steam_id}&relationship=friend"
     profile_link = get_profile_link(steam_id)
     
@@ -72,8 +73,10 @@ async def fetch_friend_count(session, steam_id):
         async with session.get(url, timeout=10) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                count = len(data.get('friendslist', {}).get('friends', []))
-                return steam_id, profile_link, count
+                friends = data.get('friendslist', {}).get('friends', [])
+                # Extract just the steamids
+                friend_ids = [friend['steamid'] for friend in friends]
+                return steam_id, profile_link, friend_ids
             elif resp.status == 403:
                 logger.warning(f"{profile_link} is private")
                 return steam_id, profile_link, None
@@ -86,28 +89,24 @@ async def fetch_friend_count(session, steam_id):
 
 async def send_telegram_message(message):
     """Send message to Telegram, splitting if too long"""
-    MAX_MESSAGE_LENGTH = 4000  # Leave some buffer under 4096 limit
+    MAX_MESSAGE_LENGTH = 4000
     
     if len(message) <= MAX_MESSAGE_LENGTH:
         await _send_single_message(message)
     else:
-        # Split message into chunks
         lines = message.split('\n')
         current_chunk = ""
         
         for line in lines:
-            # If adding this line would exceed limit, send current chunk
             if len(current_chunk + line + '\n') > MAX_MESSAGE_LENGTH:
                 if current_chunk:
                     await _send_single_message(current_chunk.strip())
                     current_chunk = line + '\n'
                 else:
-                    # Single line is too long, truncate it
                     await _send_single_message(line[:MAX_MESSAGE_LENGTH])
             else:
                 current_chunk += line + '\n'
         
-        # Send remaining chunk
         if current_chunk:
             await _send_single_message(current_chunk.strip())
 
@@ -129,16 +128,16 @@ async def _send_single_message(message):
         except Exception as e:
             logger.error(f"Telegram error: {e}")
 
-def load_previous_counts():
+def load_previous_data():
     try:
         with open(DATA_FILE, 'r') as f:
             return json.load(f)
     except:
         return {}
 
-def save_counts(counts):
+def save_data(data):
     with open(DATA_FILE, 'w') as f:
-        json.dump(counts, f)
+        json.dump(data, f)
 
 def is_first_run():
     if os.path.exists(INIT_FILE):
@@ -149,56 +148,65 @@ def is_first_run():
 
 async def check_accounts():
     first_run = is_first_run()
-    previous = load_previous_counts()
-    current = {}
-    changes = []
+    previous_data = load_previous_data()
+    current_data = {}
+    all_new_friends = []
 
     async with aiohttp.ClientSession() as session:
-        tasks = [fetch_friend_count(session, steam_id) for steam_id in STEAM_ACCOUNTS]
+        # Fetch all friends lists
+        tasks = [fetch_friend_list(session, steam_id) for steam_id in STEAM_ACCOUNTS]
         results = await asyncio.gather(*tasks)
 
-    for steam_id, profile_link, count in results:
-        if count is None:
-            continue
-        current[steam_id] = count
-        prev_count = previous.get(steam_id)
-        if prev_count is not None and not first_run:
-            if count > prev_count:
-                diff = count - prev_count
-                msg = f"🎮 <b>New Friend Alert!</b>\n\n{profile_link}: {prev_count} → {count}"
-                await send_telegram_message(msg)
-                changes.append(f"{profile_link}: +{diff}")
-            elif count < prev_count:
-                diff = prev_count - count
-                msg = f"❌ <b>Friend Removed</b>\n\n{profile_link}: {prev_count} → {count}"
-                await send_telegram_message(msg)
-                changes.append(f"{profile_link}: -{diff}")
-
-    save_counts(current)
-
+        for steam_id, profile_link, friend_list in results:
+            if friend_list is None:
+                continue
+                
+            current_data[steam_id] = {
+                'friends': friend_list,
+                'count': len(friend_list)
+            }
+            
+            # Skip comparison on first run
+            if first_run or steam_id not in previous_data:
+                continue
+                
+            previous_friends = set(previous_data[steam_id]['friends'])
+            current_friends = set(friend_list)
+            
+            # Check for new friends only
+            new_friends = current_friends - previous_friends
+            if new_friends:
+                # Add new friends to the collection
+                all_new_friends.extend(list(new_friends))
+    
+    save_data(current_data)
+    
     if first_run:
-        # Send initial summary with account count
-        total_accounts = len([steam_id for steam_id in STEAM_ACCOUNTS if steam_id in current])
+        total_accounts = len(current_data)
         private_accounts = len(STEAM_ACCOUNTS) - total_accounts
+        total_friends = sum(data['count'] for data in current_data.values())
         
         msg = f"📊 <b>Initial Setup Complete</b>\n\n"
         msg += f"✅ Monitoring {total_accounts} accounts\n"
+        msg += f"👥 Total friends across all accounts: {total_friends}\n"
         if private_accounts > 0:
             msg += f"🔒 {private_accounts} accounts are private\n"
-        msg += f"\n<i>Bot will now notify on friend changes only.</i>"
+        msg += f"\n<i>Bot will now track new friends only.</i>"
         
         await send_telegram_message(msg)
+    elif all_new_friends:
+        # Send only Steam profile links of new friends
+        friend_links = [get_profile_link(friend_id) for friend_id in all_new_friends]
         
-        # Send detailed summary in smaller chunks if needed
-        if total_accounts <= 50:  # Only send detailed list for smaller numbers
-            summary = "\n".join([f"• {get_profile_link(steam_id)}: {current.get(steam_id, 'N/A')} friends" 
-                               for steam_id in STEAM_ACCOUNTS if steam_id in current])
-            detailed_msg = f"📋 <b>Account Details</b>\n\n{summary}"
-            await send_telegram_message(detailed_msg)
-    elif changes:
-        logger.info(f"Changes detected: {', '.join(changes)}")
+        # Build message with header
+        msg = f"🎮 <b>New Friends Detected!</b>\n\n"
+        msg += "\n".join(friend_links)
+        
+        # The send_telegram_message function already handles splitting long messages
+        await send_telegram_message(msg)
+        logger.info(f"New friends detected: {len(all_new_friends)}")
     else:
-        logger.info("No changes detected")
+        logger.info("No new friends detected")
 
 if __name__ == '__main__':
     asyncio.run(check_accounts())
