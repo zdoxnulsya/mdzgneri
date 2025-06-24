@@ -76,16 +76,16 @@ async def fetch_friend_list(session, steam_id):
                 friends = data.get('friendslist', {}).get('friends', [])
                 # Extract just the steamids
                 friend_ids = [friend['steamid'] for friend in friends]
-                return steam_id, profile_link, friend_ids
+                return steam_id, friend_ids
             elif resp.status == 403:
                 logger.warning(f"{profile_link} is private")
-                return steam_id, profile_link, None
+                return steam_id, None
             else:
                 logger.error(f"{profile_link}: API error {resp.status}")
-                return steam_id, profile_link, None
+                return steam_id, None
     except Exception as e:
         logger.error(f"Error fetching {profile_link}: {e}")
-        return steam_id, profile_link, None
+        return steam_id, None
 
 async def send_telegram_message(message):
     """Send message to Telegram, splitting if too long"""
@@ -118,7 +118,7 @@ async def _send_single_message(message):
         'text': message,
         'parse_mode': 'HTML'
     }
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         try:
             async with session.post(url, data=payload) as resp:
                 if resp.status != 200:
@@ -150,59 +150,53 @@ async def check_accounts():
     first_run = is_first_run()
     previous_data = load_previous_data()
     current_data = {}
-    all_new_friends = []
+    all_new_friends = set()  # Use set to avoid duplicates
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         # Fetch all friends lists
         tasks = [fetch_friend_list(session, steam_id) for steam_id in STEAM_ACCOUNTS]
         results = await asyncio.gather(*tasks)
 
-        for steam_id, profile_link, friend_list in results:
+        for steam_id, friend_list in results:
             if friend_list is None:
                 continue
                 
-            current_data[steam_id] = {
-                'friends': friend_list,
-                'count': len(friend_list)
-            }
+            current_data[steam_id] = friend_list
             
             # Skip comparison on first run
             if first_run or steam_id not in previous_data:
                 continue
                 
-            previous_friends = set(previous_data[steam_id]['friends'])
+            previous_friends = set(previous_data[steam_id])
             current_friends = set(friend_list)
             
-            # Check for new friends only
+            # Find new friends (people who were added)
             new_friends = current_friends - previous_friends
             if new_friends:
-                # Add new friends to the collection
-                all_new_friends.extend(list(new_friends))
+                all_new_friends.update(new_friends)
     
     save_data(current_data)
     
     if first_run:
         total_accounts = len(current_data)
         private_accounts = len(STEAM_ACCOUNTS) - total_accounts
-        total_friends = sum(data['count'] for data in current_data.values())
+        total_friends = sum(len(friends) for friends in current_data.values())
         
         msg = f"📊 <b>Initial Setup Complete</b>\n\n"
         msg += f"✅ Monitoring {total_accounts} accounts\n"
         msg += f"👥 Total friends across all accounts: {total_friends}\n"
         if private_accounts > 0:
             msg += f"🔒 {private_accounts} accounts are private\n"
-        msg += f"\n<i>Bot will now track new friends only.</i>"
+        msg += f"\n<i>Bot will now track new friends.</i>"
         
         await send_telegram_message(msg)
     elif all_new_friends:
-        # Send only Steam profile links of new friends
+        # Send only the Steam profile links of new friends
         friend_links = [get_profile_link(friend_id) for friend_id in all_new_friends]
         
-        # Build message with header
-        msg = f"🎮 <b>New Friends Detected!</b>\n\n"
+        msg = f"🎮 <b>{len(all_new_friends)} New Friend{'s' if len(all_new_friends) > 1 else ''} Added!</b>\n\n"
         msg += "\n".join(friend_links)
         
-        # The send_telegram_message function already handles splitting long messages
         await send_telegram_message(msg)
         logger.info(f"New friends detected: {len(all_new_friends)}")
     else:
